@@ -1,0 +1,45 @@
+/*
+ * MoguMogu_DigitalCPL.dctl
+ * Calibrated Digital Polarizer (CPL) for transparent orange/mango PET bottle body.
+ * Separates white softbox specular glare from orange liquid using Blue channel excess:
+ *   S = max(0, B - beta * G)
+ *   R_out = R - strength * w_r * S
+ *   G_out = G - strength * w_g * S
+ *   B_out = B - strength * w_b * S
+ *
+ * Installation:
+ *   Windows: C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT\
+ *   macOS:   /Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/
+ *   Then restart DaVinci Resolve (or click "Update Lists" in Project Settings > Color Management).
+ *
+ * Usage:
+ *   1. In the Color page, add a Serial Node after your base exposure/CST (in Rec.709 / sRGB space).
+ *   2. Draw a Power Window around the bottle body BELOW the green label seam (and track it).
+ *   3. Apply this DCTL via OpenFX -> Resolve FX Color -> DCTL.
+ *   4. Adjust "Strength" (0.80 - 0.90 keeps 10-20% realistic plastic gloss).
+ *      Use "Show Specular Matte" to inspect the extracted glare mask.
+ */
+
+DEFINE_UI_PARAMS(strength, Strength, DCTLUI_SLIDER_FLOAT, 0.88, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(beta, Blue Threshold B/G, DCTLUI_SLIDER_FLOAT, 0.22, 0.05, 0.50, 0.01)
+DEFINE_UI_PARAMS(w_r, Red Weight, DCTLUI_SLIDER_FLOAT, 0.14, 0.0, 0.50, 0.01)
+DEFINE_UI_PARAMS(w_g, Green Weight, DCTLUI_SLIDER_FLOAT, 0.42, 0.0, 1.00, 0.01)
+DEFINE_UI_PARAMS(w_b, Blue Weight, DCTLUI_SLIDER_FLOAT, 1.00, 0.0, 1.20, 0.01)
+DEFINE_UI_PARAMS(show_matte, Show Specular Matte, DCTLUI_CHECK_BOX, 0)
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    float s = _fmaxf(0.0f, p_B - beta * p_G);
+
+    if (show_matte == 1)
+    {
+        float m = _clampf(s * 1.35f, 0.0f, 1.0f);
+        return make_float3(m, m, m);
+    }
+
+    float r = _clampf(p_R - strength * w_r * s, 0.0f, 1.0f);
+    float g = _clampf(p_G - strength * w_g * s, 0.0f, 1.0f);
+    float b = _clampf(p_B - strength * w_b * s, 0.0f, 1.0f);
+
+    return make_float3(r, g, b);
+}

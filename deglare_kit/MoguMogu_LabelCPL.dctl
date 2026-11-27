@@ -1,0 +1,79 @@
+/*
+ * MoguMogu_LabelCPL.dctl
+ * Pure Per-Pixel Multi-Zone Digital Polarizer (CPL) for the Mogu Mogu shrink-sleeve label.
+ * Zero tracking, zero mesh warp, zero Photoshop - preserves 100% of shadows, depth,
+ * 3D parallax, bottle rotation, water droplets, and mango cube occlusions.
+ *
+ * Works across 3 chromatic zones per pixel:
+ *   1. Lime-Green Band (protects sky-blue MOGU box & white MINUMAN text)
+ *   2. Mango Graphic Illustration (restores rich golden mango under glare)
+ *   3. Cold-White Overhead Softbox Flash on Warm-Cream Upper Label (softens flash & roll-off)
+ *
+ * Installation:
+ *   Windows: C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT\
+ *   macOS:   /Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/
+ *   Then restart DaVinci Resolve (or click "Update Lists" in Project Settings > Color Management).
+ *
+ * Usage:
+ *   1. Node 1: Apply MoguMogu_DigitalCPL.dctl with a Power Window on the bottle body below the label.
+ *   2. Node 2: Add a Serial Node, draw a simple Power Window around ONLY the label area
+ *      (below the white bottle cap, above the orange body) and track roughly.
+ *   3. Apply MoguMogu_LabelCPL.dctl via OpenFX -> Resolve FX Color -> DCTL.
+ *   4. Tune sliders to taste or enable "Show Glare Matte" to inspect each zone.
+ */
+
+DEFINE_UI_PARAMS(overall_strength, Overall Strength, DCTLUI_SLIDER_FLOAT, 1.00, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(green_strength, Green Band Glare, DCTLUI_SLIDER_FLOAT, 1.15, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(mango_strength, Mango Graphic Glare, DCTLUI_SLIDER_FLOAT, 0.98, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(white_strength, White Flash Rolloff, DCTLUI_SLIDER_FLOAT, 1.10, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(show_matte, Show Glare Matte, DCTLUI_CHECK_BOX, 0)
+
+__DEVICE__ float smoothstep_f(float e0, float e1, float x)
+{
+    float t = _clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // 1. Lime-green band glare (strictly excludes sky-blue box & white text)
+    float green_w = smoothstep_f(0.008f, 0.055f, p_G - p_R)
+                  * smoothstep_f(0.030f, 0.090f, p_G - p_B)
+                  * smoothstep_f(0.48f, 0.65f, p_R)
+                  * smoothstep_f(0.55f, 0.78f, p_G);
+    float s_green = _fmaxf(0.0f, p_B - 0.38f * p_G);
+
+    // 2. Yellow-orange mango graphic on label
+    float yellow_w = smoothstep_f(0.16f, 0.28f, _fminf(p_R, p_G) - p_B)
+                   * smoothstep_f(-0.03f, 0.03f, p_R - p_G)
+                   * smoothstep_f(0.70f, 0.85f, p_R);
+    float s_yellow = _fmaxf(0.0f, p_B - 0.26f * p_G);
+
+    // 3. Cold-white overhead flash on warm-cream white upper label
+    float white_w = smoothstep_f(0.85f, 0.94f, _fminf(p_R, p_G))
+                  * smoothstep_f(0.83f, 0.93f, p_B)
+                  * (1.0f - 0.85f * green_w)
+                  * (1.0f - yellow_w);
+    float s_white_b = _fmaxf(0.0f, p_B - 0.82f * p_R);
+    float s_white_g = _fmaxf(0.0f, p_G - 0.89f * p_R);
+    float hot_w = smoothstep_f(0.92f, 0.99f, _fminf(p_R, _fminf(p_G, p_B))) * white_w;
+
+    if (show_matte == 1)
+    {
+        return make_float3(
+            _clampf(yellow_w * s_yellow * 2.0f, 0.0f, 1.0f),
+            _clampf(green_w * s_green * 2.0f, 0.0f, 1.0f),
+            _clampf(white_w * s_white_b * 3.0f + hot_w, 0.0f, 1.0f)
+        );
+    }
+
+    float kg = overall_strength * green_strength;
+    float ky = overall_strength * mango_strength;
+    float kw = overall_strength * white_strength;
+
+    float r = p_R - kg * green_w * 0.54f * s_green - ky * yellow_w * 0.08f * s_yellow - kw * (0.045f * hot_w);
+    float g = p_G - kg * green_w * 0.16f * s_green - ky * yellow_w * 0.28f * s_yellow - kw * (0.80f * white_w * s_white_g + 0.045f * hot_w);
+    float b = p_B - kg * green_w * 1.00f * s_green - ky * yellow_w * 1.00f * s_yellow - kw * (0.90f * white_w * s_white_b + 0.055f * hot_w);
+
+    return make_float3(_clampf(r, 0.0f, 1.0f), _clampf(g, 0.0f, 1.0f), _clampf(b, 0.0f, 1.0f));
+}

@@ -1,0 +1,248 @@
+/*
+ * Universal_LabelCPL.dctl
+ * Universal Linear-Light Dichromatic Digital Polarizer (CPL) for Product Labels.
+ * Pure per-pixel transform: zero tracking, zero mesh warp, zero temporal flicker.
+ * Preserves 3D parallax, bottle rotation, shadows, water droplets, and occlusions.
+ *
+ * Works across ANY chromatic label color (Red, Orange, Yellow, Lime, Emerald,
+ * Cyan, Blue, Purple, Pink) by removing additive white/tinted specular glare in
+ * linear light while protecting neutral white text, silver/gray, and black ink.
+ *
+ * Installation (DaVinci Resolve Studio):
+ *   Windows: C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT\
+ *   macOS:   /Library/Application Support/Blackmagic Design/DaVinci Resolve/LUT/
+ *   Then restart DaVinci Resolve (or click "Update Lists" in Project Settings > Color Management).
+ *   Apply via: OpenFX -> Resolve FX Color -> DCTL (inside a rough Power Window on the label).
+ *
+ * Workflow Quick-Start:
+ *   1. Rec.709 / sRGB footage: keep Input Space on "Rec709 Standard" (or "Rec709 Gamma 24").
+ *   2. 10-bit Log / RAW footage (recommended for heavy glare):
+ *      Place between CST(Log -> Linear) and CST(Linear -> Rec709), and set
+ *      Input Space to "Scene Linear". Unclipped super-white headroom is preserved.
+ *   3. Multi-color labels: keep Target Mode on "All Chromatic Colors".
+ *   4. Isolate one color only: switch Target Mode to "Target Hue Only" and set
+ *      Target Hue Angle (0=Red, 30=Orange, 60=Yellow, 120=Green, 180=Cyan, 240=Blue, 300=Magenta).
+ *   5. Pastel labels: increase "Clean Base Floor" (0.35 - 0.55) so clean pastel ink
+ *      is not over-darkened.
+ *   6. Warm tungsten or cool LED flash: adjust "Glare Light Warmth" and "Glare Light Tint".
+ *
+ * Physical Limits (no per-pixel DCTL can solve alone):
+ *   - Neutral white, gray, or black labels (glare and ink share identical RGB ratios).
+ *   - Metallic, chrome, foil, or holographic labels (conductor glare is colored).
+ *   - 3-channel hard-clipped [255, 255, 255] whiteout (no underlying print data remains).
+ */
+
+DEFINE_UI_PARAMS(input_space, Input Space, DCTLUI_COMBO_BOX, 0, {SPACE_REC709, SPACE_GAMMA24, SPACE_LINEAR}, {Rec709 Standard, Rec709 Gamma 24, Scene Linear})
+DEFINE_UI_PARAMS(target_mode, Target Mode, DCTLUI_COMBO_BOX, 0, {MODE_ALL, MODE_HUE, MODE_BLUE, MODE_GREEN, MODE_RED}, {All Chromatic Colors, Target Hue Only, Force Blue Dark, Force Green Dark, Force Red Dark})
+DEFINE_UI_PARAMS(strength, Strength, DCTLUI_SLIDER_FLOAT, 0.90, 0.0, 1.5, 0.01)
+DEFINE_UI_PARAMS(clean_floor, Clean Base Floor, DCTLUI_SLIDER_FLOAT, 0.20, 0.0, 0.75, 0.01)
+DEFINE_UI_PARAMS(white_protect, White Text Protect, DCTLUI_SLIDER_FLOAT, 0.25, 0.05, 0.65, 0.01)
+DEFINE_UI_PARAMS(clip_protect, Highlight Clip Protect, DCTLUI_SLIDER_FLOAT, 0.40, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(luma_floor, Glare Brightness Floor, DCTLUI_SLIDER_FLOAT, 0.00, 0.0, 0.95, 0.01)
+DEFINE_UI_PARAMS(light_temp, Glare Light Warmth, DCTLUI_SLIDER_FLOAT, 0.00, -0.50, 0.50, 0.01)
+DEFINE_UI_PARAMS(light_tint, Glare Light Tint, DCTLUI_SLIDER_FLOAT, 0.00, -0.50, 0.50, 0.01)
+DEFINE_UI_PARAMS(target_hue, Target Hue Angle, DCTLUI_SLIDER_FLOAT, 0.0, 0.0, 360.0, 1.0)
+DEFINE_UI_PARAMS(hue_width, Target Hue Width, DCTLUI_SLIDER_FLOAT, 45.0, 5.0, 180.0, 1.0)
+DEFINE_UI_PARAMS(hue_softness, Target Hue Softness, DCTLUI_SLIDER_FLOAT, 20.0, 2.0, 60.0, 1.0)
+DEFINE_UI_PARAMS(flash_rolloff, Neutral Flash Rolloff, DCTLUI_SLIDER_FLOAT, 0.00, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(view_mode, View Mode, DCTLUI_COMBO_BOX, 0, {VIEW_FINAL, VIEW_GLARE_MATTE, VIEW_MASK_DEBUG}, {Final Output, Glare Matte, Protection Mask})
+
+__DEVICE__ float safe_pow_f(float x, float p)
+{
+    return (x > 1e-7f) ? _powf(x, p) : 0.0f;
+}
+
+__DEVICE__ float smoothstep_f(float e0, float e1, float x)
+{
+    float d = e1 - e0;
+    if (d < 1e-6f && d > -1e-6f)
+    {
+        return (x >= e1) ? 1.0f : 0.0f;
+    }
+    float t = _clampf((x - e0) / d, 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float rgb_to_hue_f(float r, float g, float b)
+{
+    float mx = _fmaxf(r, _fmaxf(g, b));
+    float mn = _fminf(r, _fminf(g, b));
+    float d = mx - mn;
+    if (d < 1e-6f)
+    {
+        return 0.0f;
+    }
+    float h = 0.0f;
+    if (mx == r)
+    {
+        h = (g - b) / d;
+        if (h < 0.0f)
+        {
+            h += 6.0f;
+        }
+    }
+    else if (mx == g)
+    {
+        h = (b - r) / d + 2.0f;
+    }
+    else
+    {
+        h = (r - g) / d + 4.0f;
+    }
+    return h * 60.0f;
+}
+
+__DEVICE__ float hue_dist_f(float h1, float h2)
+{
+    float d = (h1 >= h2) ? (h1 - h2) : (h2 - h1);
+    if (d > 180.0f)
+    {
+        d = 360.0f - d;
+    }
+    return d;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // Step A: Linearize
+    float gamma = (input_space == SPACE_REC709) ? 2.2f : ((input_space == SPACE_GAMMA24) ? 2.4f : 1.0f);
+    float rl = p_R;
+    float gl = p_G;
+    float bl = p_B;
+    if (input_space != SPACE_LINEAR)
+    {
+        rl = safe_pow_f(p_R, gamma);
+        gl = safe_pow_f(p_G, gamma);
+        bl = safe_pow_f(p_B, gamma);
+    }
+
+    float rl_pos = _fmaxf(rl, 0.0f);
+    float gl_pos = _fmaxf(gl, 0.0f);
+    float bl_pos = _fmaxf(bl, 0.0f);
+
+    // Step B: Illuminant Normalization
+    float lr = _fmaxf(0.25f, 1.0f + 0.45f * light_temp + 0.20f * light_tint);
+    float lg = _fmaxf(0.25f, 1.0f - 0.30f * light_tint);
+    float lb = _fmaxf(0.25f, 1.0f - 0.65f * light_temp + 0.20f * light_tint);
+    float lmax = _fmaxf(lr, _fmaxf(lg, lb));
+    lr /= lmax;
+    lg /= lmax;
+    lb /= lmax;
+
+    float pr = rl_pos / lr;
+    float pg = gl_pos / lg;
+    float pb = bl_pos / lb;
+
+    float pmax = _fmaxf(pr, _fmaxf(pg, pb));
+    float pmin = _fminf(pr, _fminf(pg, pb));
+
+    // Step C: Dark Channel & Effective Chroma by target_mode
+    float p_dark = pmin;
+    float ch_eff = pmax - pmin;
+    if (target_mode == MODE_BLUE)
+    {
+        p_dark = pb;
+        ch_eff = _fmaxf(0.0f, _fmaxf(pr, pg) - pb);
+    }
+    else if (target_mode == MODE_GREEN)
+    {
+        p_dark = pg;
+        ch_eff = _fmaxf(0.0f, _fmaxf(pr, pb) - pg);
+    }
+    else if (target_mode == MODE_RED)
+    {
+        p_dark = pr;
+        ch_eff = _fmaxf(0.0f, _fmaxf(pg, pb) - pr);
+    }
+
+    // Step D: Glare-Invariant Linear Specular Estimate
+    float beta_lin = _clampf(safe_pow_f(_clampf(clean_floor, 0.0f, 0.85f), 2.2f), 0.0f, 0.75f);
+    float k = beta_lin / _fmaxf(1e-4f, 1.0f - beta_lin);
+    float s_raw = _fmaxf(0.0f, p_dark - k * ch_eff);
+
+    // Step E: White/Silver/Warm-White/Black Protection + Luma Floor + Linear-Hue Gate
+    float wp = _fmaxf(0.005f, white_protect);
+    float sat_lin = ch_eff / _fmaxf(pmax, 1e-4f);
+    float sat_w = smoothstep_f(0.75f * wp, 1.35f * wp, sat_lin);
+    float chroma_w = smoothstep_f(0.015f, 0.060f, ch_eff);
+    float neutral_w = sat_w * chroma_w;
+
+    float lum_w = 1.0f;
+    if (luma_floor > 0.001f)
+    {
+        float lum_disp = (input_space != SPACE_LINEAR) ? _fmaxf(p_R, _fmaxf(p_G, p_B)) : safe_pow_f(pmax, 1.0f / 2.2f);
+        lum_w = smoothstep_f(_fmaxf(0.0f, luma_floor - 0.10f), _fminf(1.0f, luma_floor + 0.08f), lum_disp);
+    }
+
+    float hw = 1.0f;
+    if (target_mode == MODE_HUE)
+    {
+        float h = rgb_to_hue_f(pr, pg, pb);
+        float hd = hue_dist_f(h, target_hue);
+        hw = 1.0f - smoothstep_f(_fmaxf(0.0f, hue_width - hue_softness), hue_width + hue_softness, hd);
+    }
+
+    float mask = neutral_w * lum_w * hw;
+    float s = strength * mask * s_raw;
+
+    // Step F: Rec.709 Highlight Clip / Camera Shoulder Protection
+    float cwr = 0.0f;
+    float cwg = 0.0f;
+    float cwb = 0.0f;
+    if (input_space != SPACE_LINEAR && clip_protect > 0.001f)
+    {
+        cwr = smoothstep_f(0.945f, 0.998f, p_R);
+        cwg = smoothstep_f(0.945f, 0.998f, p_G);
+        cwb = smoothstep_f(0.945f, 0.998f, p_B);
+    }
+
+    float sr = s * lr * (1.0f - clip_protect * cwr);
+    float sg = s * lg * (1.0f - clip_protect * cwg);
+    float sb = s * lb * (1.0f - clip_protect * cwb);
+
+    // Step G: Diagnostic View Modes
+    if (view_mode == VIEW_GLARE_MATTE)
+    {
+        float m = _clampf(s * 1.5f, 0.0f, 1.0f);
+        return make_float3(m, m, m);
+    }
+    if (view_mode == VIEW_MASK_DEBUG)
+    {
+        float clip_dbg = _fmaxf(cwr, _fmaxf(cwg, cwb)) * mask;
+        return make_float3(_clampf(clip_dbg, 0.0f, 1.0f), _clampf(mask, 0.0f, 1.0f), _clampf(1.0f - mask, 0.0f, 1.0f));
+    }
+
+    // Step H: Linear Subtraction & Re-Encode Without Clamping HDR Scene-Linear
+    float ro_l = (rl > 0.0f) ? _fmaxf(0.0f, rl - sr) : rl;
+    float go_l = (gl > 0.0f) ? _fmaxf(0.0f, gl - sg) : gl;
+    float bo_l = (bl > 0.0f) ? _fmaxf(0.0f, bl - sb) : bl;
+
+    float ro = ro_l;
+    float go = go_l;
+    float bo = bo_l;
+    if (input_space != SPACE_LINEAR)
+    {
+        float inv_g = 1.0f / gamma;
+        ro = _clampf(safe_pow_f(ro_l, inv_g), 0.0f, 1.0f);
+        go = _clampf(safe_pow_f(go_l, inv_g), 0.0f, 1.0f);
+        bo = _clampf(safe_pow_f(bo_l, inv_g), 0.0f, 1.0f);
+    }
+
+    // Step I: Optional Neutral Flash Rolloff
+    if (flash_rolloff > 0.001f)
+    {
+        float lum = 0.2126f * ro + 0.7152f * go + 0.0722f * bo;
+        float knee = (input_space != SPACE_LINEAR) ? 0.85f : 0.70f;
+        if (lum > knee)
+        {
+            float excess = lum - knee;
+            float comp = excess / (1.0f + 3.0f * flash_rolloff * excess);
+            float scale = (knee + comp) / lum;
+            ro *= scale;
+            go *= scale;
+            bo *= scale;
+        }
+    }
+
+    return make_float3(ro, go, bo);
+}
